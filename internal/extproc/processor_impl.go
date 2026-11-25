@@ -520,6 +520,15 @@ func (u *upstreamProcessor[ReqT, RespT, RespChunkT, EndpointSpecT]) ProcessReque
 	}
 
 	headerMutation, bodyMutation := mutationsFromTranslationResult(newHeaders, newBody)
+	// Retry header restoration may restore the listener's original multipart boundary.
+	// Start with the filtered body's type, then preserve translator and configured overrides.
+	if contentType != "" {
+		u.requestHeaders["content-type"] = contentType
+		headerMutation.SetHeaders = append([]*corev3.HeaderValueOption{{
+			AppendAction: corev3.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD,
+			Header:       &corev3.HeaderValue{Key: "content-type", RawValue: []byte(contentType)},
+		}}, headerMutation.SetHeaders...)
+	}
 	// Keep auth's header view coherent with the provider request, then reapply configured precedence.
 	for _, header := range newHeaders {
 		u.requestHeaders[header.Key()] = header.Value()

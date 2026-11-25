@@ -20,6 +20,7 @@ import (
 
 	"github.com/envoyproxy/ai-gateway/internal/endpointspec"
 	"github.com/envoyproxy/ai-gateway/internal/filterapi"
+	"github.com/envoyproxy/ai-gateway/internal/headermutator"
 	"github.com/envoyproxy/ai-gateway/internal/translator"
 )
 
@@ -30,50 +31,67 @@ func TestUpstreamMultipartUsesFilteredBoundaryForFirstAttemptAndRetry(t *testing
 	spec := endpointspec.TranscriptionEndpointSpec{}
 	_, parsed, _, _, err := spec.ParseMultipartBody(original, originalType, false)
 	require.NoError(t, err)
-	parent := &transcriptionProcessorRouterFilter{
-		originalRequestBodyRaw: original, originalRequestBody: parsed,
-		requestHeaders: map[string]string{"content-type": originalType},
-		config:         &filterapi.RuntimeConfig{}, upstreamFilterCount: 1,
-	}
-	input, contentType := filtered, filteredType
-	for attempt := 1; attempt <= 2; attempt++ {
-		parent.upstreamFilterCount = attempt
-		tr := translator.NewTranscriptionOpenAIToOpenAITranslator("", "provider-model")
-		tr.(translator.ContentTypeSetter).SetContentType(originalType)
-		processor := &transcriptionProcessorUpstreamFilter{
-			parent: parent, translator: tr, metrics: &mockMetrics{}, logger: slog.Default(),
-			requestHeaders: map[string]string{":path": "/v1/audio/transcriptions", "content-type": contentType},
-		}
-		_, err = processor.ProcessRequestHeaders(t.Context(), &corev3.HeaderMap{Headers: []*corev3.HeaderValue{{Key: "content-type", RawValue: []byte(contentType)}}})
-		require.NoError(t, err)
-		response, err := processor.ProcessRequestBody(t.Context(), &extprocv3.HttpBody{Body: input, EndOfStream: true})
-		require.NoError(t, err)
-		require.Nil(t, response.GetImmediateResponse())
-		common := response.GetRequestBody().GetResponse()
-		output := common.GetBodyMutation().GetBody()
-		var outputType string
-		for _, h := range common.GetHeaderMutation().GetSetHeaders() {
-			if h.GetHeader().GetKey() == "content-type" {
-				outputType = string(h.GetHeader().GetRawValue())
+	for _, override := range []string{"provider-model", ""} {
+		t.Run("override="+override, func(t *testing.T) {
+			parent := &transcriptionProcessorRouterFilter{
+				originalRequestBodyRaw: original, originalRequestBody: parsed,
+				requestHeaders: map[string]string{"content-type": originalType},
+				config:         &filterapi.RuntimeConfig{}, upstreamFilterCount: 1,
 			}
-		}
-		_, params, err := mime.ParseMediaType(outputType)
-		require.NoError(t, err)
-		reader := multipart.NewReader(bytes.NewReader(output), params["boundary"])
-		fields := map[string]string{}
-		for {
-			part, err := reader.NextPart()
-			if errors.Is(err, io.EOF) {
-				break
+			input, contentType := filtered, filteredType
+			for attempt := 1; attempt <= 2; attempt++ {
+				parent.upstreamFilterCount = attempt
+				tr := translator.NewTranscriptionOpenAIToOpenAITranslator("", override)
+				tr.(translator.ContentTypeSetter).SetContentType(originalType)
+				processor := &transcriptionProcessorUpstreamFilter{
+					parent: parent, translator: tr, metrics: &mockMetrics{}, logger: slog.Default(),
+					requestHeaders: map[string]string{":path": "/v1/audio/transcriptions", "content-type": contentType},
+				}
+				processor.headerMutator = headermutator.NewHeaderMutator(nil, parent.requestHeaders)
+				headers, err := processor.ProcessRequestHeaders(t.Context(), &corev3.HeaderMap{Headers: []*corev3.HeaderValue{{Key: "content-type", RawValue: []byte(contentType)}}})
+				require.NoError(t, err)
+				outputType := contentType
+				for _, h := range headers.GetRequestHeaders().GetResponse().GetHeaderMutation().GetSetHeaders() {
+					if h.GetHeader().GetKey() == "content-type" {
+						outputType = string(h.GetHeader().GetRawValue())
+					}
+				}
+				response, err := processor.ProcessRequestBody(t.Context(), &extprocv3.HttpBody{Body: input, EndOfStream: true})
+				require.NoError(t, err)
+				require.Nil(t, response.GetImmediateResponse())
+				common := response.GetRequestBody().GetResponse()
+				output := common.GetBodyMutation().GetBody()
+				if output == nil {
+					output = input
+				}
+				for _, h := range common.GetHeaderMutation().GetSetHeaders() {
+					if h.GetHeader().GetKey() == "content-type" {
+						outputType = string(h.GetHeader().GetRawValue())
+					}
+				}
+				_, params, err := mime.ParseMediaType(outputType)
+				require.NoError(t, err)
+				reader := multipart.NewReader(bytes.NewReader(output), params["boundary"])
+				fields := map[string]string{}
+				for {
+					part, err := reader.NextPart()
+					if errors.Is(err, io.EOF) {
+						break
+					}
+					require.NoError(t, err)
+					data, err := io.ReadAll(part)
+					require.NoError(t, err)
+					fields[part.FormName()] = string(data)
+				}
+				require.Equal(t, "[[EMAIL_1]]", fields["prompt"])
+				require.Equal(t, "fixture-audio", fields["file"])
+				expectedModel := override
+				if expectedModel == "" {
+					expectedModel = "whisper-1"
+				}
+				require.Equal(t, expectedModel, fields["model"])
+				input, contentType = output, outputType
 			}
-			require.NoError(t, err)
-			data, err := io.ReadAll(part)
-			require.NoError(t, err)
-			fields[part.FormName()] = string(data)
-		}
-		require.Equal(t, "[[EMAIL_1]]", fields["prompt"])
-		require.Equal(t, "fixture-audio", fields["file"])
-		require.Equal(t, "provider-model", fields["model"])
-		input, contentType = output, outputType
+		})
 	}
 }
