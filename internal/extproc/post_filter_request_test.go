@@ -12,20 +12,28 @@ import (
 	"log/slog"
 	"testing"
 
+	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	extprocv3 "github.com/envoyproxy/go-control-plane/envoy/service/ext_proc/v3"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/types/known/structpb"
 
 	"github.com/envoyproxy/ai-gateway/internal/apischema/openai"
+	"github.com/envoyproxy/ai-gateway/internal/backendauth"
 	"github.com/envoyproxy/ai-gateway/internal/filterapi"
+	"github.com/envoyproxy/ai-gateway/internal/headermutator"
 	"github.com/envoyproxy/ai-gateway/internal/internalapi"
 	"github.com/envoyproxy/ai-gateway/internal/json"
 	"github.com/envoyproxy/ai-gateway/internal/translator"
 )
 
-type postFilterAuthRecorder struct{ bodies [][]byte }
+type postFilterAuthRecorder struct {
+	bodies [][]byte
+	paths  []string
+}
 
-func (r *postFilterAuthRecorder) Do(_ context.Context, _ map[string]string, body []byte) ([]internalapi.Header, error) {
+func (r *postFilterAuthRecorder) Do(_ context.Context, headers map[string]string, body []byte) ([]internalapi.Header, error) {
 	r.bodies = append(r.bodies, bytes.Clone(body))
+	r.paths = append(r.paths, headers[":path"])
 	return nil, nil
 }
 
@@ -115,4 +123,140 @@ func TestUpstreamTranslationRejectsInvalidPostFilterBody(t *testing.T) {
 	require.NotNil(t, response.GetImmediateResponse())
 	require.Equal(t, 400, int(response.GetImmediateResponse().GetStatus().GetCode()))
 	require.Empty(t, auth.bodies)
+}
+
+func postFilterFixture(t *testing.T) (*chatCompletionProcessorUpstreamFilter, []byte) {
+	t.Helper()
+	original := []byte(`{"model":"alias","messages":[{"role":"user","content":"original-private-value"}],"max_tokens":100}`)
+	filtered := []byte(`{"model":"alias","messages":[{"role":"user","content":"[[EMAIL_1]]"}],"max_tokens":100}`)
+	var parsed openai.ChatCompletionRequest
+	require.NoError(t, json.Unmarshal(original, &parsed))
+	return &chatCompletionProcessorUpstreamFilter{
+		parent:         &chatCompletionProcessorRouterFilter{originalRequestBodyRaw: original, originalRequestBody: &parsed, config: &filterapi.RuntimeConfig{}},
+		translator:     translator.NewChatCompletionOpenAIToOpenAITranslator("", "provider-model"),
+		metrics:        &mockMetrics{},
+		logger:         slog.Default(),
+		requestHeaders: map[string]string{":path": "/v1/chat/completions", ":method": "POST"},
+	}, filtered
+}
+
+func TestUpstreamTranslationProcessesBufferedBodyWithTrailers(t *testing.T) {
+	processor, filtered := postFilterFixture(t)
+	auth := &postFilterAuthRecorder{}
+	processor.handler = auth
+	response, err := processor.ProcessRequestBody(t.Context(), &extprocv3.HttpBody{Body: filtered, EndOfStream: false})
+	require.NoError(t, err)
+	require.Contains(t, string(response.GetRequestBody().GetResponse().GetBodyMutation().GetBody()), "[[EMAIL_1]]")
+	require.Len(t, auth.bodies, 1)
+}
+
+func TestUpstreamTranslationAuthenticatesFinalPath(t *testing.T) {
+	processor, _ := postFilterFixture(t)
+	processor.parent.originalRequestBody.Model = "claude-sonnet-4-5"
+	processor.translator = translator.NewChatCompletionOpenAIToAWSAnthropicTranslator("bedrock-2023-05-31", "")
+	auth := &postFilterAuthRecorder{}
+	processor.handler = auth
+	_, err := processor.ProcessRequestHeaders(t.Context(), nil)
+	require.NoError(t, err)
+	response, err := processor.ProcessRequestBody(t.Context(), &extprocv3.HttpBody{
+		Body:        []byte(`{"model":"claude-haiku-4-5","messages":[{"role":"user","content":"[[EMAIL_1]]"}],"max_tokens":100}`),
+		EndOfStream: true,
+	})
+	require.NoError(t, err)
+	var finalPath string
+	for _, header := range response.GetRequestBody().GetResponse().GetHeaderMutation().GetSetHeaders() {
+		if header.GetHeader().GetKey() == ":path" {
+			finalPath = string(header.GetHeader().GetRawValue())
+		}
+	}
+	require.Contains(t, finalPath, "claude-haiku-4-5")
+	require.Equal(t, finalPath, auth.paths[0])
+}
+
+func TestUpstreamTranslationRetainsEnvoyCredentialsBetweenCallbacks(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		metadata bool
+		fallback bool
+		clear    bool
+		replace  bool
+		want     string
+	}{
+		{name: "metadata without fallback", metadata: true, want: "Bearer metadata-fixture"},
+		{name: "configured fallback", fallback: true, want: "Bearer configured-fixture"},
+		{name: "missing credential fails closed"},
+		{name: "body metadata revokes credential", metadata: true, clear: true},
+		{name: "body metadata updates credential", metadata: true, replace: true, want: "Bearer metadata-next-fixture"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			processor, filtered := postFilterFixture(t)
+			handler, err := backendauth.NewHandler(t.Context(), &filterapi.BackendAuth{
+				APIKey:             &filterapi.APIKeyAuth{Key: "configured-fixture"},
+				CredentialOverride: &filterapi.CredentialOverride{DynamicMetadataNamespace: "trusted-auth", DynamicMetadataKey: "credential", FallbackToConfigured: tc.fallback},
+			})
+			require.NoError(t, err)
+			processor.handler = handler
+			server := &Server{logger: slog.Default()}
+			ctx := context.WithValue(t.Context(), loggerContextKey, slog.Default())
+			headerRequest := &extprocv3.ProcessingRequest{Request: &extprocv3.ProcessingRequest_RequestHeaders{RequestHeaders: &extprocv3.HttpHeaders{Headers: &corev3.HeaderMap{}}}}
+			if tc.metadata {
+				headerRequest.MetadataContext = &corev3.Metadata{FilterMetadata: map[string]*structpb.Struct{
+					"trusted-auth": {Fields: map[string]*structpb.Value{"credential": structpb.NewStringValue("metadata-fixture")}},
+				}}
+			}
+			_, err = server.processMsg(ctx, processor, headerRequest, "fixture", true)
+			require.NoError(t, err)
+			bodyRequest := &extprocv3.ProcessingRequest{Request: &extprocv3.ProcessingRequest_RequestBody{
+				RequestBody: &extprocv3.HttpBody{Body: filtered, EndOfStream: true},
+			}}
+			if tc.clear {
+				bodyRequest.MetadataContext = &corev3.Metadata{}
+			}
+			if tc.replace {
+				bodyRequest.MetadataContext = &corev3.Metadata{FilterMetadata: map[string]*structpb.Struct{
+					"trusted-auth": {Fields: map[string]*structpb.Value{"credential": structpb.NewStringValue("metadata-next-fixture")}},
+				}}
+			}
+			response, err := server.processMsg(ctx, processor, bodyRequest, "fixture", true)
+			require.NoError(t, err)
+			if tc.want == "" {
+				require.Equal(t, 401, int(response.GetImmediateResponse().GetStatus().GetCode()))
+				return
+			}
+			require.Nil(t, response.GetImmediateResponse())
+			var authorization string
+			for _, header := range response.GetRequestBody().GetResponse().GetHeaderMutation().GetSetHeaders() {
+				if header.GetHeader().GetKey() == "Authorization" {
+					authorization = string(header.GetHeader().GetRawValue())
+				}
+			}
+			require.Equal(t, tc.want, authorization)
+		})
+	}
+}
+
+func TestUpstreamTranslationPreservesConfiguredHeaderPrecedence(t *testing.T) {
+	processor, _ := postFilterFixture(t)
+	processor.translator = &mockTranslator{
+		t:                 t,
+		expRequestBody:    processor.parent.originalRequestBody,
+		retHeaderMutation: []internalapi.Header{{"x-provider-header", "translated"}, {"x-drop", "translated"}},
+		retBodyMutation:   processor.parent.originalRequestBodyRaw,
+	}
+	processor.headerMutator = headermutator.NewHeaderMutator(&filterapi.HTTPHeaderMutation{
+		Set:    []filterapi.HTTPHeader{{Name: "x-provider-header", Value: "configured"}},
+		Remove: []string{"x-drop"},
+	}, processor.requestHeaders)
+	response, err := processor.ProcessRequestBody(t.Context(), &extprocv3.HttpBody{Body: processor.parent.originalRequestBodyRaw, EndOfStream: true})
+	require.NoError(t, err)
+	require.Equal(t, "configured", processor.requestHeaders["x-provider-header"])
+	mutation := response.GetRequestBody().GetResponse().GetHeaderMutation()
+	require.Contains(t, mutation.GetRemoveHeaders(), "x-drop")
+	var value string
+	for _, header := range mutation.GetSetHeaders() {
+		if header.GetHeader().GetKey() == "x-provider-header" {
+			value = string(header.GetHeader().GetRawValue())
+		}
+	}
+	require.Equal(t, "configured", value)
 }

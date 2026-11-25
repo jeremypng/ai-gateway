@@ -135,9 +135,8 @@ type (
 		costs metrics.TokenUsage
 		// metrics tracking.
 		metrics metrics.Metrics
-		// bodyBuf accumulates request body chunks in FULL_DUPLEX_STREAMED mode.
-		// The complete body is processed when EndOfStream is true.
-		bodyBuf []byte
+		// Request-scoped credential metadata can arrive before the deferred body-auth callback.
+		requestMetadata *corev3.Metadata
 	}
 )
 
@@ -352,6 +351,11 @@ func (u *upstreamProcessor[ReqT, RespT, RespChunkT, EndpointSpecT]) onRetry() bo
 	return u.parent.upstreamFilterCount > 1
 }
 
+// setEnvoyMetadata retains request-scoped credential metadata between ext-proc callbacks.
+func (u *upstreamProcessor[ReqT, RespT, RespChunkT, EndpointSpecT]) setEnvoyMetadata(metadata *corev3.Metadata) {
+	u.requestMetadata = metadata
+}
+
 // ProcessRequestHeaders implements [Processor.ProcessRequestHeaders].
 //
 // At the upstream filter, header-level mutations (path rewrite, auth, route
@@ -435,10 +439,7 @@ func (u *upstreamProcessor[ReqT, RespT, RespChunkT, EndpointSpecT]) ProcessReque
 }
 
 // ProcessRequestBody implements [Processor.ProcessRequestBody].
-// The configured BUFFERED mode supplies a complete body. Intermediate
-// chunks are accumulated in bodyBuf and the body is held (empty BodyMutation).
-// When EndOfStream is true, the complete body is processed: translation,
-// bodyMutation, and auth signing are applied to the full body.
+// BUFFERED mode supplies the complete body even when trailers follow and EndOfStream is false.
 func (u *upstreamProcessor[ReqT, RespT, RespChunkT, EndpointSpecT]) ProcessRequestBody(ctx context.Context, rawBody *extprocv3.HttpBody) (res *extprocv3.ProcessingResponse, err error) {
 	defer func() {
 		if err != nil {
@@ -446,26 +447,8 @@ func (u *upstreamProcessor[ReqT, RespT, RespChunkT, EndpointSpecT]) ProcessReque
 		}
 	}()
 
-	// Accumulate chunks until end_of_stream.
-	u.bodyBuf = append(u.bodyBuf, rawBody.Body...)
-	if !rawBody.EndOfStream {
-		return &extprocv3.ProcessingResponse{
-			Response: &extprocv3.ProcessingResponse_RequestBody{
-				RequestBody: &extprocv3.BodyResponse{
-					Response: &extprocv3.CommonResponse{
-						Status: extprocv3.CommonResponse_CONTINUE,
-						BodyMutation: &extprocv3.BodyMutation{
-							Mutation: &extprocv3.BodyMutation_Body{Body: []byte{}},
-						},
-					},
-				},
-			},
-		}, nil
-	}
-
-	// All chunks received — process the complete body.
-	body := u.bodyBuf
-	u.bodyBuf = nil
+	ctx = backendauth.WithEnvoyMetadata(ctx, u.requestMetadata)
+	body := rawBody.Body
 	if u.parent.filteredRequestBodyRaw == nil {
 		u.parent.filteredRequestBodyRaw = append([]byte{}, body...)
 	} else if u.onRetry() {
@@ -510,6 +493,20 @@ func (u *upstreamProcessor[ReqT, RespT, RespChunkT, EndpointSpecT]) ProcessReque
 	}
 
 	headerMutation, bodyMutation := mutationsFromTranslationResult(newHeaders, newBody)
+	// Keep auth's header view coherent with the provider request, then reapply configured precedence.
+	for _, header := range newHeaders {
+		u.requestHeaders[header.Key()] = header.Value()
+	}
+	if u.headerMutator != nil {
+		sets, removes := u.headerMutator.Mutate(u.requestHeaders, false)
+		headerMutation.RemoveHeaders = append(headerMutation.RemoveHeaders, removes...)
+		for _, header := range sets {
+			headerMutation.SetHeaders = append(headerMutation.SetHeaders, &corev3.HeaderValueOption{
+				AppendAction: corev3.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD,
+				Header:       &corev3.HeaderValue{Key: header.Key(), RawValue: []byte(header.Value())},
+			})
+		}
+	}
 
 	// Apply backend httpBodyMutation on top of the translator's body (if any).
 	mutatorHasMutations := u.bodyMutator != nil && u.bodyMutator.HasMutations()
