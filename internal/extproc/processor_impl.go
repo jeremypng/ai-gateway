@@ -94,9 +94,10 @@ type (
 		originalRequestBodyRaw []byte
 		// filteredRequestBodyRaw is captured after listener filters and before provider translation.
 		// Retries must use this representation, never the earlier router-phase snapshot.
-		filteredRequestBodyRaw []byte
-		originalModel          internalapi.OriginalModel
-		forceBodyMutation      bool
+		filteredRequestBodyRaw     []byte
+		filteredRequestContentType string
+		originalModel              internalapi.OriginalModel
+		forceBodyMutation          bool
 		// tracer is the tracer used for requests.
 		tracer tracingapi.RequestTracer[ReqT, RespT, RespChunkT]
 		// span is the tracing span for this request, created in ProcessRequestBody.
@@ -136,7 +137,8 @@ type (
 		// metrics tracking.
 		metrics metrics.Metrics
 		// Request-scoped credential metadata can arrive before the deferred body-auth callback.
-		requestMetadata *corev3.Metadata
+		requestMetadata         *corev3.Metadata
+		postListenerContentType string
 	}
 )
 
@@ -361,7 +363,17 @@ func (u *upstreamProcessor[ReqT, RespT, RespChunkT, EndpointSpecT]) setEnvoyMeta
 // At the upstream filter, header-level mutations (path rewrite, auth, route
 // header mutations) are performed here, and body-level mutations
 // (modelNameOverride, httpBodyMutation) are deferred to ProcessRequestBody.
-func (u *upstreamProcessor[ReqT, RespT, RespChunkT, EndpointSpecT]) ProcessRequestHeaders(ctx context.Context, _ *corev3.HeaderMap) (res *extprocv3.ProcessingResponse, err error) {
+func (u *upstreamProcessor[ReqT, RespT, RespChunkT, EndpointSpecT]) ProcessRequestHeaders(ctx context.Context, headerMap *corev3.HeaderMap) (res *extprocv3.ProcessingResponse, err error) {
+	// Save the filtered body's type before header translation may create a provider boundary.
+	u.postListenerContentType = u.requestHeaders["content-type"]
+	for _, header := range headerMap.GetHeaders() {
+		if strings.EqualFold(header.GetKey(), "content-type") {
+			u.postListenerContentType = header.GetValue()
+			if header.GetRawValue() != nil {
+				u.postListenerContentType = string(header.GetRawValue())
+			}
+		}
+	}
 	defer func() {
 		if err != nil {
 			u.metrics.RecordRequestCompletion(ctx, false, u.requestHeaders)
@@ -449,11 +461,17 @@ func (u *upstreamProcessor[ReqT, RespT, RespChunkT, EndpointSpecT]) ProcessReque
 
 	ctx = backendauth.WithEnvoyMetadata(ctx, u.requestMetadata)
 	body := rawBody.Body
+	contentType := u.postListenerContentType
+	if contentType == "" {
+		contentType = u.parent.requestHeaders["content-type"]
+	}
 	if u.parent.filteredRequestBodyRaw == nil {
 		u.parent.filteredRequestBodyRaw = append([]byte{}, body...)
+		u.parent.filteredRequestContentType = contentType
 	} else if u.onRetry() {
 		// Envoy may replay a translated attempt body; translate the filtered client request again instead.
 		body = bytes.Clone(u.parent.filteredRequestBodyRaw)
+		contentType = u.parent.filteredRequestContentType
 	}
 
 	requestBody := u.parent.originalRequestBody
@@ -464,7 +482,6 @@ func (u *upstreamProcessor[ReqT, RespT, RespChunkT, EndpointSpecT]) ProcessReque
 		var mutatedBody []byte
 		var filteredStream bool
 		costConfigured := len(u.parent.config.RequestCosts) > 0 || len(u.parent.config.GlobalRequestCosts) > 0
-		contentType := u.parent.requestHeaders["content-type"]
 		if strings.HasPrefix(strings.ToLower(contentType), "multipart/form-data") {
 			_, requestBody, filteredStream, mutatedBody, parseErr = u.parent.eh.ParseMultipartBody(body, contentType, costConfigured)
 		} else {
@@ -490,6 +507,9 @@ func (u *upstreamProcessor[ReqT, RespT, RespChunkT, EndpointSpecT]) ProcessReque
 	forceBodyMutation := u.onRetry() || u.parent.forceBodyMutation || parserBodyMutation
 
 	// Apply the translator's RequestBody on the actual body from Envoy.
+	if setter, ok := u.translator.(translator.ContentTypeSetter); ok {
+		setter.SetContentType(contentType)
+	}
 	newHeaders, newBody, err := u.translator.RequestBody(body, requestBody, forceBodyMutation)
 	if err != nil {
 		if userFacingErr := internalapi.GetUserFacingError(err); userFacingErr != nil {
