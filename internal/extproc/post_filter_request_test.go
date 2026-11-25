@@ -66,6 +66,7 @@ func TestUpstreamTranslationPreservesPostFilterContent(t *testing.T) {
 						originalRequestBodyRaw: original,
 						originalRequestBody:    &parsed,
 						config:                 &filterapi.RuntimeConfig{},
+						stream:                 streamed,
 						upstreamFilterCount:    1,
 					}
 					processor := &chatCompletionProcessorUpstreamFilter{
@@ -259,4 +260,38 @@ func TestUpstreamTranslationPreservesConfiguredHeaderPrecedence(t *testing.T) {
 		}
 	}
 	require.Equal(t, "configured", value)
+}
+
+func TestUpstreamTranslationRejectsFilteredStreamModeChange(t *testing.T) {
+	for _, originalStream := range []bool{false, true} {
+		t.Run(fmt.Sprintf("original_stream=%t", originalStream), func(t *testing.T) {
+			processor, _ := postFilterFixture(t)
+			processor.parent.stream = originalStream
+			processor.parent.originalRequestBody.Stream = originalStream
+			auth := &postFilterAuthRecorder{}
+			processor.handler = auth
+			body := []byte(fmt.Sprintf(`{"model":"alias","messages":[{"role":"user","content":"[[EMAIL_1]]"}],"stream":%t}`, !originalStream))
+			response, err := processor.ProcessRequestBody(t.Context(), &extprocv3.HttpBody{Body: body, EndOfStream: true})
+			require.NoError(t, err)
+			require.Equal(t, 400, int(response.GetImmediateResponse().GetStatus().GetCode()))
+			require.Empty(t, auth.bodies)
+		})
+	}
+}
+
+func TestUpstreamTranslationForwardsParserCorrectedBytes(t *testing.T) {
+	processor, _ := postFilterFixture(t)
+	processor.parent.stream = true
+	processor.parent.originalRequestBody.Stream = true
+	processor.parent.config.GlobalRequestCosts = []filterapi.RuntimeGlobalRequestCost{{}}
+	processor.translator = translator.NewChatCompletionOpenAIToOpenAITranslator("", "")
+	body := []byte(`{"model":"alias","messages":[{"role":"user","content":"[[EMAIL_1]]"}],"stream":true}`)
+	response, err := processor.ProcessRequestBody(t.Context(), &extprocv3.HttpBody{Body: body, EndOfStream: true})
+	require.NoError(t, err)
+	corrected := response.GetRequestBody().GetResponse().GetBodyMutation().GetBody()
+	require.NotEmpty(t, corrected)
+	require.Contains(t, string(corrected), "[[EMAIL_1]]")
+	var parsed openai.ChatCompletionRequest
+	require.NoError(t, json.Unmarshal(corrected, &parsed))
+	require.True(t, parsed.StreamOptions.IncludeUsage)
 }

@@ -457,16 +457,18 @@ func (u *upstreamProcessor[ReqT, RespT, RespChunkT, EndpointSpecT]) ProcessReque
 	}
 
 	requestBody := u.parent.originalRequestBody
+	parserBodyMutation := false
 	if !bytes.Equal(body, u.parent.originalRequestBodyRaw) {
 		// Translators can consume the typed request rather than raw bytes. Keep both representations coherent.
 		var parseErr error
 		var mutatedBody []byte
+		var filteredStream bool
 		costConfigured := len(u.parent.config.RequestCosts) > 0 || len(u.parent.config.GlobalRequestCosts) > 0
 		contentType := u.parent.requestHeaders["content-type"]
 		if strings.HasPrefix(strings.ToLower(contentType), "multipart/form-data") {
-			_, requestBody, _, mutatedBody, parseErr = u.parent.eh.ParseMultipartBody(body, contentType, costConfigured)
+			_, requestBody, filteredStream, mutatedBody, parseErr = u.parent.eh.ParseMultipartBody(body, contentType, costConfigured)
 		} else {
-			_, requestBody, _, mutatedBody, parseErr = u.parent.eh.ParseBody(body, costConfigured)
+			_, requestBody, filteredStream, mutatedBody, parseErr = u.parent.eh.ParseBody(body, costConfigured)
 		}
 		if parseErr != nil {
 			if userFacingErr := internalapi.GetUserFacingError(parseErr); userFacingErr != nil {
@@ -474,13 +476,18 @@ func (u *upstreamProcessor[ReqT, RespT, RespChunkT, EndpointSpecT]) ProcessReque
 			}
 			return nil, fmt.Errorf("failed to parse post-filter request body: %w", parseErr)
 		}
+		// The listener selected response processing and tracing for the original protocol mode.
+		if filteredStream != u.parent.stream {
+			return u.respondLocally(ctx, 400, "BadRequest", "post-filter request must preserve stream mode"), nil
+		}
 		if mutatedBody != nil {
 			body = mutatedBody
+			parserBodyMutation = true
 		}
 	}
 
 	// Determine forceBodyMutation: on retry we must replay the body.
-	forceBodyMutation := u.onRetry() || u.parent.forceBodyMutation
+	forceBodyMutation := u.onRetry() || u.parent.forceBodyMutation || parserBodyMutation
 
 	// Apply the translator's RequestBody on the actual body from Envoy.
 	newHeaders, newBody, err := u.translator.RequestBody(body, requestBody, forceBodyMutation)
