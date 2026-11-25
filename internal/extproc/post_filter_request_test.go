@@ -154,10 +154,14 @@ func TestUpstreamTranslationProcessesBufferedBodyWithTrailers(t *testing.T) {
 func TestUpstreamTranslationAuthenticatesFinalPath(t *testing.T) {
 	processor, _ := postFilterFixture(t)
 	processor.parent.originalRequestBody.Model = "claude-sonnet-4-5"
+	processor.parent.originalModel = "claude-sonnet-4-5"
+	original, err := json.Marshal(processor.parent.originalRequestBody)
+	require.NoError(t, err)
+	processor.parent.originalRequestBodyRaw = original
 	processor.translator = translator.NewChatCompletionOpenAIToAWSAnthropicTranslator("bedrock-2023-05-31", "")
 	auth := &postFilterAuthRecorder{}
 	processor.handler = auth
-	_, err := processor.ProcessRequestHeaders(t.Context(), nil)
+	_, err = processor.ProcessRequestHeaders(t.Context(), nil)
 	require.NoError(t, err)
 	response, err := processor.ProcessRequestBody(t.Context(), &extprocv3.HttpBody{
 		Body:        []byte(`{"model":"claude-haiku-4-5","messages":[{"role":"user","content":"[[EMAIL_1]]"}],"max_tokens":100}`),
@@ -172,6 +176,21 @@ func TestUpstreamTranslationAuthenticatesFinalPath(t *testing.T) {
 	}
 	require.Contains(t, finalPath, "claude-haiku-4-5")
 	require.Equal(t, finalPath, auth.paths[0])
+	require.Equal(t, "claude-haiku-4-5", processor.metrics.(*mockMetrics).requestModel)
+	require.Equal(t, "claude-sonnet-4-5", processor.metrics.(*mockMetrics).originalModel)
+}
+
+func TestUpstreamTranslationPreservesRequestModelOverride(t *testing.T) {
+	processor, _ := postFilterFixture(t)
+	processor.parent.originalModel = "client-model"
+	processor.modelNameOverride = "provider-model"
+	processor.requestHeaders[internalapi.ModelNameHeaderKeyDefault] = "provider-model"
+	_, err := processor.ProcessRequestHeaders(t.Context(), nil)
+	require.NoError(t, err)
+	_, err = processor.ProcessRequestBody(t.Context(), &extprocv3.HttpBody{Body: []byte(`{"model":"filtered-model","messages":[{"role":"user","content":"[[EMAIL_1]]"}]}`), EndOfStream: true})
+	require.NoError(t, err)
+	require.Equal(t, "provider-model", processor.metrics.(*mockMetrics).requestModel)
+	require.Equal(t, "client-model", processor.metrics.(*mockMetrics).originalModel)
 }
 
 func TestUpstreamTranslationRetainsEnvoyCredentialsBetweenCallbacks(t *testing.T) {

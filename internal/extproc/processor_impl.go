@@ -482,11 +482,12 @@ func (u *upstreamProcessor[ReqT, RespT, RespChunkT, EndpointSpecT]) ProcessReque
 		var parseErr error
 		var mutatedBody []byte
 		var filteredStream bool
+		var filteredModel internalapi.OriginalModel
 		costConfigured := len(u.parent.config.RequestCosts) > 0 || len(u.parent.config.GlobalRequestCosts) > 0
 		if strings.HasPrefix(strings.ToLower(contentType), "multipart/form-data") {
-			_, requestBody, filteredStream, mutatedBody, parseErr = u.parent.eh.ParseMultipartBody(body, contentType, costConfigured)
+			filteredModel, requestBody, filteredStream, mutatedBody, parseErr = u.parent.eh.ParseMultipartBody(body, contentType, costConfigured)
 		} else {
-			_, requestBody, filteredStream, mutatedBody, parseErr = u.parent.eh.ParseBody(body, costConfigured)
+			filteredModel, requestBody, filteredStream, mutatedBody, parseErr = u.parent.eh.ParseBody(body, costConfigured)
 		}
 		if parseErr != nil {
 			if userFacingErr := internalapi.GetUserFacingError(parseErr); userFacingErr != nil {
@@ -498,6 +499,8 @@ func (u *upstreamProcessor[ReqT, RespT, RespChunkT, EndpointSpecT]) ProcessReque
 		if filteredStream != u.parent.stream {
 			return u.respondLocally(ctx, 400, "BadRequest", "post-filter request must preserve stream mode"), nil
 		}
+		// Attribute the effective request model without changing the router's original-model identity.
+		u.metrics.SetRequestModel(cmp.Or(u.modelNameOverride, filteredModel))
 		if mutatedBody != nil {
 			body = mutatedBody
 			parserBodyMutation = true
