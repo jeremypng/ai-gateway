@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -536,6 +537,15 @@ func (u *upstreamProcessor[ReqT, RespT, RespChunkT, EndpointSpecT]) ProcessReque
 	if u.headerMutator != nil {
 		sets, removes := u.headerMutator.Mutate(u.requestHeaders, false)
 		headerMutation.RemoveHeaders = append(headerMutation.RemoveHeaders, removes...)
+		// Envoy removes headers before applying sets. Discard superseded baseline/translator sets.
+		headerMutation.SetHeaders = slices.DeleteFunc(headerMutation.SetHeaders, func(header *corev3.HeaderValueOption) bool {
+			for _, name := range removes {
+				if strings.EqualFold(header.GetHeader().GetKey(), name) {
+					return true
+				}
+			}
+			return false
+		})
 		for _, header := range sets {
 			headerMutation.SetHeaders = append(headerMutation.SetHeaders, &corev3.HeaderValueOption{
 				AppendAction: corev3.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD,

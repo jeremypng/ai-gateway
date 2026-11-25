@@ -255,6 +255,7 @@ func TestUpstreamTranslationPreservesConfiguredHeaderPrecedence(t *testing.T) {
 	require.Contains(t, mutation.GetRemoveHeaders(), "x-drop")
 	var value string
 	for _, header := range mutation.GetSetHeaders() {
+		require.NotEqual(t, "x-drop", header.GetHeader().GetKey())
 		if header.GetHeader().GetKey() == "x-provider-header" {
 			value = string(header.GetHeader().GetRawValue())
 		}

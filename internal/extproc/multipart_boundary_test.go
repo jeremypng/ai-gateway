@@ -95,3 +95,54 @@ func TestUpstreamMultipartUsesFilteredBoundaryForFirstAttemptAndRetry(t *testing
 		})
 	}
 }
+
+func TestUpstreamMultipartConfiguredContentTypePrecedence(t *testing.T) {
+	original, originalType := buildTestMultipartBody(t, map[string]string{"model": "whisper-1", "prompt": "original"}, "fixture.wav", []byte("fixture-audio"))
+	filtered, filteredType := buildTestMultipartBody(t, map[string]string{"model": "whisper-1", "prompt": "[[EMAIL_1]]"}, "fixture.wav", []byte("fixture-audio"))
+	_, parsed, _, _, err := (endpointspec.TranscriptionEndpointSpec{}).ParseMultipartBody(original, originalType, false)
+	require.NoError(t, err)
+	for _, configuredType := range []string{"", "application/configured"} {
+		t.Run("configured="+configuredType, func(t *testing.T) {
+			for _, attempt := range []int{1, 2} {
+				parent := &transcriptionProcessorRouterFilter{
+					originalRequestBodyRaw: original, originalRequestBody: parsed,
+					requestHeaders: map[string]string{"content-type": originalType},
+					config:         &filterapi.RuntimeConfig{}, upstreamFilterCount: attempt,
+				}
+				if attempt == 2 {
+					parent.filteredRequestBodyRaw, parent.filteredRequestContentType = filtered, filteredType
+				}
+				tr := translator.NewTranscriptionOpenAIToOpenAITranslator("", "")
+				tr.(translator.ContentTypeSetter).SetContentType(originalType)
+				config := &filterapi.HTTPHeaderMutation{Remove: []string{"content-type"}}
+				if configuredType != "" {
+					config.Set = []filterapi.HTTPHeader{{Name: "content-type", Value: configuredType}}
+				}
+				processor := &transcriptionProcessorUpstreamFilter{
+					parent: parent, translator: tr, metrics: &mockMetrics{}, logger: slog.Default(),
+					requestHeaders: map[string]string{"content-type": filteredType},
+					headerMutator:  headermutator.NewHeaderMutator(config, parent.requestHeaders),
+				}
+				headers, err := processor.ProcessRequestHeaders(t.Context(), &corev3.HeaderMap{Headers: []*corev3.HeaderValue{{Key: "content-type", RawValue: []byte(filteredType)}}})
+				require.NoError(t, err)
+				response, err := processor.ProcessRequestBody(t.Context(), &extprocv3.HttpBody{Body: filtered, EndOfStream: true})
+				require.NoError(t, err)
+				require.Nil(t, response.GetImmediateResponse())
+				outgoingType := filteredType
+				for _, mutation := range []*extprocv3.HeaderMutation{headers.GetRequestHeaders().GetResponse().GetHeaderMutation(), response.GetRequestBody().GetResponse().GetHeaderMutation()} {
+					for _, key := range mutation.GetRemoveHeaders() {
+						if key == "content-type" {
+							outgoingType = ""
+						}
+					}
+					for _, header := range mutation.GetSetHeaders() {
+						if header.GetHeader().GetKey() == "content-type" {
+							outgoingType = string(header.GetHeader().GetRawValue())
+						}
+					}
+				}
+				require.Equal(t, configuredType, outgoingType, "attempt %d", attempt)
+			}
+		})
+	}
+}
