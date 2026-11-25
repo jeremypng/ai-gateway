@@ -155,13 +155,13 @@ func (s *Server) PostTranslateModify(ctx context.Context, req *egextension.PostT
 				Http2ProtocolOptions: &corev3.Http2ProtocolOptions{
 					// https://github.com/envoyproxy/gateway/blob/932b8b155fa562ae917da19b497a4370733478f1/internal/xds/translator/listener.go#L50-L53
 					InitialConnectionWindowSize: wrapperspb.UInt32(1048576),
-					// Increase from the default 64KB to 16MB. In BUFFERED mode,
+					// Cover the deployment chart's maximum 48 MiB admitted body. In BUFFERED mode,
 					// envoy sends the full request body to the extproc over this
 					// UDS gRPC stream. With the default 64KB stream window, bodies
 					// larger than ~64KB cause the send buffer to hit the high
 					// watermark, triggering a null-pointer dereference in envoy
 					// 1.37.1's ext_proc filter.
-					InitialStreamWindowSize: wrapperspb.UInt32(16 * 1024 * 1024),
+					InitialStreamWindowSize: wrapperspb.UInt32(48 * 1024 * 1024),
 				},
 			},
 		}}
