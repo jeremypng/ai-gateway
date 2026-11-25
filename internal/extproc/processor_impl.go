@@ -92,6 +92,9 @@ type (
 		// when the request is retried.
 		originalRequestBody    *ReqT
 		originalRequestBodyRaw []byte
+		// filteredRequestBodyRaw is captured after listener filters and before provider translation.
+		// Retries must use this representation, never the earlier router-phase snapshot.
+		filteredRequestBodyRaw []byte
 		originalModel          internalapi.OriginalModel
 		forceBodyMutation      bool
 		// tracer is the tracer used for requests.
@@ -336,9 +339,9 @@ func (r *routerProcessor[ReqT, RespT, RespChunkT, EndpointSpecT]) ProcessRequest
 			RequestBody: &extprocv3.BodyResponse{
 				Response: &extprocv3.CommonResponse{
 					HeaderMutation:  headerMutation,
-					ClearRouteCache:  true,
-					BodyMutation:     bodyMutation,
-					Status:           status,
+					ClearRouteCache: true,
+					BodyMutation:    bodyMutation,
+					Status:          status,
 				},
 			},
 		},
@@ -432,7 +435,7 @@ func (u *upstreamProcessor[ReqT, RespT, RespChunkT, EndpointSpecT]) ProcessReque
 }
 
 // ProcessRequestBody implements [Processor.ProcessRequestBody].
-// In FULL_DUPLEX_STREAMED mode, the body arrives in chunks. Intermediate
+// The configured BUFFERED mode supplies a complete body. Intermediate
 // chunks are accumulated in bodyBuf and the body is held (empty BodyMutation).
 // When EndOfStream is true, the complete body is processed: translation,
 // bodyMutation, and auth signing are applied to the full body.
@@ -463,12 +466,41 @@ func (u *upstreamProcessor[ReqT, RespT, RespChunkT, EndpointSpecT]) ProcessReque
 	// All chunks received — process the complete body.
 	body := u.bodyBuf
 	u.bodyBuf = nil
+	if u.parent.filteredRequestBodyRaw == nil {
+		u.parent.filteredRequestBodyRaw = append([]byte{}, body...)
+	} else if u.onRetry() {
+		// Envoy may replay a translated attempt body; translate the filtered client request again instead.
+		body = bytes.Clone(u.parent.filteredRequestBodyRaw)
+	}
+
+	requestBody := u.parent.originalRequestBody
+	if !bytes.Equal(body, u.parent.originalRequestBodyRaw) {
+		// Translators can consume the typed request rather than raw bytes. Keep both representations coherent.
+		var parseErr error
+		var mutatedBody []byte
+		costConfigured := len(u.parent.config.RequestCosts) > 0 || len(u.parent.config.GlobalRequestCosts) > 0
+		contentType := u.parent.requestHeaders["content-type"]
+		if strings.HasPrefix(strings.ToLower(contentType), "multipart/form-data") {
+			_, requestBody, _, mutatedBody, parseErr = u.parent.eh.ParseMultipartBody(body, contentType, costConfigured)
+		} else {
+			_, requestBody, _, mutatedBody, parseErr = u.parent.eh.ParseBody(body, costConfigured)
+		}
+		if parseErr != nil {
+			if userFacingErr := internalapi.GetUserFacingError(parseErr); userFacingErr != nil {
+				return u.respondLocally(ctx, 400, "BadRequest", userFacingErr.Error()), nil
+			}
+			return nil, fmt.Errorf("failed to parse post-filter request body: %w", parseErr)
+		}
+		if mutatedBody != nil {
+			body = mutatedBody
+		}
+	}
 
 	// Determine forceBodyMutation: on retry we must replay the body.
 	forceBodyMutation := u.onRetry() || u.parent.forceBodyMutation
 
 	// Apply the translator's RequestBody on the actual body from Envoy.
-	newHeaders, newBody, err := u.translator.RequestBody(body, u.parent.originalRequestBody, forceBodyMutation)
+	newHeaders, newBody, err := u.translator.RequestBody(body, requestBody, forceBodyMutation)
 	if err != nil {
 		if userFacingErr := internalapi.GetUserFacingError(err); userFacingErr != nil {
 			u.logger.Info("returning user-facing error for invalid request", slog.String("error", err.Error()))
